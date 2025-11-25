@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CryptoSignalBot</title>
+
+<!-- Lightweight Charts (stable) -->
+<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+
+<style>
+  :root{--bg:#071a2b;--card:#0b1220;--muted:#9fb3c8;--accent:#10b981}
+  html,body{height:100%;margin:0;font-family:Inter, 'Noto Sans Bengali', system-ui;background:linear-gradient(180deg,#071027,#071a2b);color:#e6eef8}
+  .wrap{max-width:1180px;margin:16px auto;padding:16px}
+  header{display:flex;align-items:center;gap:12px}
+  h1{font-size:18px;margin:0}
+  .controls{margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  select,button{padding:8px 10px;border-radius:8px;border:0;background:#0d2a3a;color:#e6eef8}
+  #chart{height:440px;border-radius:8px;margin-top:12px;background:var(--card);box-shadow:0 6px 24px rgba(2,6,23,0.6)}
+  .panel{display:grid;grid-template-columns:1fr 360px;gap:12px;margin-top:12px}
+  .side{background:rgba(255,255,255,0.02);padding:12px;border-radius:8px}
+  .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px dashed rgba(255,255,255,0.03)}
+  .signal{font-weight:700;padding:6px;border-radius:6px;display:inline-block}
+  .buy{background:rgba(34,197,94,0.12);color:#34d399}
+  .sell{background:rgba(239,68,68,0.12);color:#fb7185}
+  .hold{background:rgba(148,163,184,0.07);color:var(--muted)}
+  .history{max-height:260px;overflow:auto;margin-top:8px}
+  .history-item{padding:8px;border-radius:6px;margin-bottom:8px;background:rgba(255,255,255,0.02);display:flex;justify-content:space-between}
+  .meta{color:var(--muted);font-size:13px;margin-top:8px}
+  footer{margin-top:12px;color:var(--muted);font-size:13px}
+  @media(max-width:980px){.panel{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div style="width:44px;height:44px;border-radius:8px;background:#0f3850;display:flex;align-items:center;justify-content:center;font-weight:700">₿</div>
+      <div>
+        <h1>CryptoSignalBot</h1>
+        <div style="color:var(--muted);font-size:13px;margin-top:4px">Binance public data — client-side heuristic predictions (5/10/15m)</div>
+      </div>
+    </header>
+
+    <div class="controls">
+      <label for="pair">Pair:</label>
+      <select id="pair"><option value="BTCUSDT">BTCUSDT</option><option value="ETHUSDT">ETHUSDT</option></select>
+
+      <label for="interval">Interval:</label>
+      <select id="interval"><option value="1m">1m</option><option value="5m">5m</option></select>
+
+      <button id="reload">Reload</button>
+      <div style="flex:1"></div>
+      <div style="color:var(--muted);font-size:13px">Prediction logic: slope (linreg) + RSI + volatility → weighted vote</div>
+    </div>
+
+    <div class="panel">
+      <div>
+        <div id="chart"></div>
+        <div class="meta">Last update: <span id="lastUpdate">-</span> · Candles: <span id="cCount">-</span></div>
+      </div>
+
+      <div class="side">
+        <div class="row"><div>Current Price</div><div id="price">-</div></div>
+        <div class="row"><div>Market Status (30 steps)</div><div id="marketStatus">-</div></div>
+        <div class="row"><div>Suggestion</div><div id="suggestion" class="signal hold">-</div></div>
+        <div class="row"><div>Confidence</div><div id="confidence">-</div></div>
+
+        <h4 style="margin-top:10px;margin-bottom:6px">Predictions</h4>
+        <div id="preds">
+          <div class="row"><div>+5 min</div><div id="p5">-</div></div>
+          <div class="row"><div>+10 min</div><div id="p10">-</div></div>
+          <div class="row"><div>+15 min</div><div id="p15">-</div></div>
+        </div>
+
+        <h4 style="margin-top:10px;margin-bottom:6px">Signal History</h4>
+        <div class="history" id="history"></div>
+
+        
+      </div>
+    </div>
+
+    <center><footer>CryptoSignalBot © Humayun Shariar Himu </footer></center> 
+  </div>
+
+<script>
+// ===== CONFIG =====
+const BINANCE_REST = 'https://api.binance.com/api/v3/klines';
+const pairEl = document.getElementById('pair'), intervalEl = document.getElementById('interval'), reloadBtn = document.getElementById('reload');
+const priceEl = document.getElementById('price'), lastUpdateEl = document.getElementById('lastUpdate'), cCountEl = document.getElementById('cCount');
+const marketStatusEl = document.getElementById('marketStatus'), suggestionEl = document.getElementById('suggestion'), confidenceEl = document.getElementById('confidence');
+const p5El = document.getElementById('p5'), p10El = document.getElementById('p10'), p15El = document.getElementById('p15');
+const historyEl = document.getElementById('history');
+
+const LIMIT_MAP = { '1m': 500, '5m': 600 };
+
+// ===== CHART SETUP =====
+let chart, candleSeries;
+function createChart(){
+  const container = document.getElementById('chart');
+  container.innerHTML = '';
+  chart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 440,
+    layout: { background: { color: '#071a2b' }, textColor: '#dff3ff' },
+    grid: { vertLines: { color: 'rgba(255,255,255,0.02)' }, horzLines: { color: 'rgba(255,255,255,0.02)' } },
+    rightPriceScale: { borderColor: 'rgba(255,255,255,0.04)' }, timeScale: { borderColor: 'rgba(255,255,255,0.04)', timeVisible:true }
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#26a69a', downColor: '#ef5350', wickUpColor:'#26a69a', wickDownColor:'#ef5350', borderVisible:false
+  });
+}
+
+// ===== DATA FETCH & WS =====
+let ws = null;
+let candles = [];
+
+async function fetchKlines(symbol, interval, limit){
+  const params = new URLSearchParams({ symbol, interval, limit });
+  const url = `${BINANCE_REST}?${params.toString()}`;
+  const resp = await fetch(url);
+  if(!resp.ok) throw new Error('REST error: '+resp.status);
+  const raw = await resp.json();
+  return raw.map(k => ({ time: Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
+}
+
+function startWebSocket(symbol, interval){
+  if(ws){ try{ ws.close(); }catch(e){} ws=null; }
+  const stream = `${symbol.toLowerCase()}@kline_${interval}`;
+  ws = new WebSocket(`wss://stream.binance.com:9443/ws/${stream}`);
+  ws.onopen = ()=> console.log('ws open', stream);
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      const k = msg.k;
+      const candle = { time: Math.floor(k.t/1000), open:+k.o, high:+k.h, low:+k.l, close:+k.c, volume:+k.v };
+      // replace or push
+      if(candles.length && candles[candles.length-1].time === candle.time){
+        candles[candles.length-1] = candle;
+      } else {
+        candles.push(candle);
+        if(candles.length > 2000) candles.shift();
+      }
+      candleSeries.setData(candles.map(x => ({ time:x.time, open:x.open, high:x.high, low:x.low, close:x.close })));
+      priceEl.innerText = parseFloat(candle.close).toFixed(2);
+      lastUpdateEl.innerText = new Date().toLocaleString();
+      cCountEl.innerText = candles.length;
+      // When candle closed (k.x === true), compute signals. msg.k.x indicates closed.
+      if(k.x) computeAllSignals();
+    } catch(e){ console.error(e); }
+  };
+  ws.onclose = ()=> console.log('ws closed');
+  ws.onerror = (e)=> console.warn('ws error', e);
+}
+
+// ===== INDICATORS & HELPERS =====
+function sma(arr, period){
+  if(arr.length < period) return null;
+  const part = arr.slice(-period);
+  return part.reduce((a,b)=>a+b,0)/period;
+}
+function stddev(arr, period){
+  if(arr.length < period) return 0;
+  const part = arr.slice(-period);
+  const m = part.reduce((a,b)=>a+b,0)/period;
+  const v = part.reduce((a,b)=>a+(b-m)*(b-m),0)/period;
+  return Math.sqrt(v);
+}
+function rsi(closes, period=14){
+  if(closes.length <= period) return 50;
+  let gains = 0, losses = 0;
+  for(let i = closes.length - period; i < closes.length; i++){
+    const diff = closes[i] - closes[i-1];
+    if(diff>0) gains += diff; else losses += Math.abs(diff);
+  }
+  const avgGain = gains/period, avgLoss = losses/period;
+  if(avgLoss === 0) return 100;
+  const rs = avgGain/avgLoss;
+  return 100 - (100/(1+rs));
+}
+// linear regression slope (per step)
+function linregSlope(closes, N=20){
+  if(closes.length < 2) return 0;
+  const n = Math.min(N, closes.length);
+  const ys = closes.slice(-n);
+  const xs = Array.from({length:n}, (_,i) => i);
+  const meanX = (n-1)/2;
+  const meanY = ys.reduce((a,b)=>a+b,0)/n;
+  let num=0, den=0;
+  for(let i=0;i<n;i++){ num += (i-meanX)*(ys[i]-meanY); den += (i-meanX)*(i-meanX); }
+  return den === 0 ? 0 : num/den;
+}
+
+// estimate future price using slope (steps ahead)
+function estimateFuture(closes, minutesAhead, stepMinutes){
+  const slope = linregSlope(closes, Math.min(40, closes.length)); // price change per step
+  const steps = Math.max(1, Math.round(minutesAhead / stepMinutes));
+  const last = closes[closes.length-1];
+  return last + slope * steps;
+}
+
+// ===== PREDICTION & SUGGESTION LOGIC =====
+function computeAllSignals(){
+  if(!candles.length) return;
+  const closes = candles.map(c => c.close);
+  const last = closes[closes.length - 1];
+  // Market status (relative to sma30)
+  const sma30 = sma(closes, Math.min(30, closes.length));
+  let marketStatus = 'INSUFFICIENT';
+  if(sma30){
+    const diff = (last - sma30)/sma30;
+    if(diff > 0.0025) marketStatus = 'UP (strong)';
+    else if(diff > 0.0005) marketStatus = 'UP (weak)';
+    else if(diff < -0.0025) marketStatus = 'DOWN (strong)';
+    else if(diff < -0.0005) marketStatus = 'DOWN (weak)';
+    else marketStatus = 'FLAT';
+  }
+  marketStatusEl.innerText = marketStatus;
+
+  // base interval minutes
+  const baseInterval = intervalEl.value === '1m' ? 1 : (intervalEl.value === '5m' ? 5 : 1);
+  // horizons
+  const horizons = [5,10,15];
+  const out = {};
+
+  const rsiVal = rsi(closes, 14);
+  const vol = stddev(closes, 20) / Math.max(0.0001, closes[closes.length-1]); // relative volatility
+
+  horizons.forEach(h => {
+    const est = estimateFuture(closes, h, baseInterval);
+    const rel = (est - last) / last;
+    // thresholds (tunable)
+    const tSmall = 0.0012; // 0.12%
+    const tStrong = 0.003; // 0.3%
+    let action = 'HOLD';
+    if(rel > tSmall) action = 'BUY';
+    if(rel < -tSmall) action = 'SELL';
+
+    // confidence calculation: combine magnitude, RSI extremeness, and volatility (lower vol -> more confidence)
+    const magScore = Math.min(1, Math.abs(rel) / 0.005); // larger rel -> higher
+    const rsiScore = Math.min(1, Math.abs(rsiVal - 50) / 50); // RSI away from 50 -> more signal
+    const volScore = Math.max(0, 1 - vol*10); // high vol reduces score
+    const conf = Math.max(0.05, Math.min(0.99, 0.6*magScore + 0.25*rsiScore + 0.15*volScore));
+
+    out[h] = { est, rel, action, confidence: conf };
+  });
+
+  // Update UI for preds
+  p5El.innerText = `${(out[5].rel*100).toFixed(3)}% → ${out[5].action} (${(out[5].confidence*100).toFixed(0)}%)`;
+  p10El.innerText = `${(out[10].rel*100).toFixed(3)}% → ${out[10].action} (${(out[10].confidence*100).toFixed(0)}%)`;
+  p15El.innerText = `${(out[15].rel*100).toFixed(3)}% → ${out[15].action} (${(out[15].confidence*100).toFixed(0)}%)`;
+
+  // Combine suggestions by weighted vote (confidence-weighted)
+  const votes = { BUY:0, SELL:0, HOLD:0 };
+  horizons.forEach(h => { votes[out[h].action] += out[h].confidence; });
+
+  // Winner
+  let winner = 'HOLD', winVal = votes.HOLD;
+  Object.keys(votes).forEach(k => { if(votes[k] > winVal){ winVal = votes[k]; winner = k; }});
+
+  // Normalize global confidence
+  const total = votes.BUY + votes.SELL + votes.HOLD || 1;
+  let globalConf = Math.min(0.99, winVal / total);
+
+  // Safety: if market status strongly contradicts winner, reduce confidence
+  if((marketStatus.startsWith('DOWN') && winner === 'BUY') || (marketStatus.startsWith('UP') && winner === 'SELL')){
+    globalConf = Math.max(0.01, globalConf - 0.25);
+  }
+
+  // Update suggestion UI
+  suggestionEl.className = 'signal ' + (winner === 'BUY' ? 'buy' : (winner === 'SELL' ? 'sell' : 'hold'));
+  suggestionEl.innerText = winner;
+  confidenceEl.innerText = (globalConf*100).toFixed(0) + '%';
+
+  // Save to history
+  addHistory({ time: Math.floor(Date.now()/1000), pair: pairEl.value, suggestion: winner, confidence: globalConf });
+}
+
+// ===== HISTORY =====
+function addHistory(item){
+  const el = document.createElement('div'); el.className = 'history-item';
+  const left = document.createElement('div'); left.innerText = `${new Date(item.time*1000).toLocaleString()} — ${item.pair}`;
+  const right = document.createElement('div'); right.innerText = `${item.suggestion} ${(item.confidence*100).toFixed(0)}%`;
+  right.className = item.suggestion === 'BUY' ? 'buy' : item.suggestion === 'SELL' ? 'sell' : 'hold';
+  el.appendChild(left); el.appendChild(right);
+  historyEl.prepend(el);
+  while(historyEl.children.length > 200) historyEl.removeChild(historyEl.lastChild);
+}
+
+// ===== INIT / UI =====
+reloadBtn.addEventListener('click', init);
+pairEl.addEventListener('change', init);
+intervalEl.addEventListener('change', init);
+
+async function init(){
+  try {
+    createChart();
+    const pair = pairEl.value;
+    const interval = intervalEl.value;
+    const limit = LIMIT_MAP[interval] || 500;
+    candles = await fetchKlines(pair, interval, limit);
+    candleSeries.setData(candles.map(c => ({ time:c.time, open:c.open, high:c.high, low:c.low, close:c.close })));
+    priceEl.innerText = candles.length ? candles[candles.length-1].close.toFixed(2) : '-';
+    lastUpdateEl.innerText = new Date().toLocaleString();
+    cCountEl.innerText = candles.length;
+    computeAllSignals();
+    startWebSocket(pair, interval);
+  } catch(e){
+    console.error(e);
+    alert('Failed to init: ' + (e.message || e));
+  }
+}
+
+window.addEventListener('resize', ()=> {
+  const container = document.getElementById('chart');
+  if(chart) chart.applyOptions({ width: container.clientWidth });
+});
+
+// start
+init();
+
+</script>
+</body>
+</html>
